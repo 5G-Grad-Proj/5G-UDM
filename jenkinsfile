@@ -1,67 +1,77 @@
 pipeline {
     agent any
+    triggers {
+    githubPush()
+  }
+    environment {
+        DOCKERHUB_CREDENTIALS = credentials('Dockerhub')
+        }
 
     stages {
-
-    stage('Verify Branch') 
-       {
-         steps {
-            echo "$GIT_BRANCH"
-               } 
-        }
-
-    stage('Build Docker Imageh') 
-             {
-         steps {
-               // Build the Docker image
-                sh 'docker build -t nf_udm:latest towards5gs-helm/udm'
-                
-            
-             }
-             }
-
-
-    stage('Push Docker Image') 
-             {
-         steps {
-                 // Log in to Docker Hub 
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_PASSWORD')])
-                 {
-                    sh 'docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD'
-                }
-
-                
-                sh 'docker tag nf_udm:latest gradproj/nf_udm:latest'
-                sh 'docker push gradproj/nf_udm:latest'
-             }
-
-
-       
-
-        stage('Deploy UDM to Kubernetes') {
-            environment {
-                // Set the Docker image name and tag to deploy
-                DOCKER_IMAGE = "gradproj/nf_udm:latest"
-            }
-
+        stage('Verify Branch') {
             steps {
-                // Deploy the UDM Helm chart to Kubernetes
-                sh "helm upgrade --install udm towards5gs-helm/udm --set image.repository=$DOCKER_IMAGE"
+                echo "$GIT_BRANCH"
             }
         }
 
-        stage('Run Tests') {
+        stage('Login to Dockerhub') {
             steps {
-                // Run tests against the deployed UDM instance
-                sh "curl http://<UDM_IP>:<UDM_PORT>/health"
+                sh 'echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin'
             }
         }
 
-        stage('Clean Up') {
+        stage('Pulling base image from Dockerhub') {
             steps {
-                // Remove the UDM deployment from Kubernetes
-                sh "helm uninstall udm"
+                    sh 'docker pull gradproj/udm-base'
+            }
+        }
+
+        stage('docker build') {
+            steps {
+                sh(script: """
+                    docker images -a
+                    docker build -t gradproj/5g-udm:latest . 
+                    docker images -a
+                """)
+            }
+        }
+
+        stage('Scan Image for Common Vulnerabilities and Exposures') {
+            steps {
+                sh 'trivy image gradproj/5g-udm --output trivy-report.json'
+            }
+        }
+        stage('Pushing to Dockerhub') {
+            steps {
+                sh 'docker push gradproj/5g-udm:latest'
+            }
+        }
+
+        stage('Build and Package Helm Chart') {
+            steps {
+                sh 'helm package ./helm/'
+            }
+        }
+
+        stage('Configure Kubernetes Context') {
+            steps {
+                sh 'aws eks --region us-east-1 update-kubeconfig --name 9G-Core-Net'
+            }
+        }
+
+        stage('Deploy Helm Chart on EKS') {
+            steps {
+                sh 'helm upgrade --install udm ./helm/'
             }
         }
     }
-} ##ahmed
+
+    post {
+        always {
+            // Archiving Test Result
+            archiveArtifacts artifacts: 'trivy-report.json', fingerprint: true
+            sh 'docker rmi gradproj/5g-udm'
+            sh 'docker rmi gradproj/udm-base'
+        }
+    }
+}
